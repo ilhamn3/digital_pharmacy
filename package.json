@@ -1,0 +1,26 @@
+{
+  "name": "pharmacy-pos",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "db"
+  ],
+  "scripts": {
+    "db:migrate": "npm --workspace=db run migrate",
+    "db:migrate:down": "npm --workspace=db run migrate:down",
+    "db:seed": "npm --workspace=db run seed",
+    "db:seed:reference": "npm --workspace=db run seed:reference",
+    "db:seed:demo": "npm --workspace=db run seed:demo",
+    "bootstrap:owner": "npm --workspace=db run bootstrap:owner --",
+    "dev:api": "npm --workspace=apps/api run dev",
+    "dev:web": "npm --workspace=apps/web run dev",
+    "build:api": "npm --workspace=apps/api run build",
+    "build:web": "npm --workspace=apps/web run build",
+    "test": "npm --workspace=apps/api test"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
+

@@ -1,0 +1,27 @@
+{
+  "name": "db",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "migrate": "node-pg-migrate -m migrations --envPath ../.env up",
+    "migrate:down": "node-pg-migrate -m migrations --envPath ../.env down",
+    "migrate:create": "node-pg-migrate --migration-file-language sql -m migrations create",
+    "seed": "tsx seeds/seed.ts",
+    "seed:reference": "tsx seeds/reference.ts",
+    "seed:demo": "tsx seeds/demo.ts",
+    "bootstrap:owner": "tsx scripts/bootstrap-owner.ts"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "dotenv": "^16.4.7",
+    "node-pg-migrate": "^7.8.0",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/bcrypt": "^5.0.2",
+    "@types/pg": "^8.11.11",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}
+
