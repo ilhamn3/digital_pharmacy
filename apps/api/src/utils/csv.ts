@@ -99,7 +99,8 @@ export function parseCsv(rawCsvText: string): CsvParseResult {
   }
 
   // Parse header
-  const headers = splitCsvLine(lines[0]).map((h) => h.trim().toLowerCase());
+  const rawHeaders = splitCsvLine(lines[0]).map((h) => h.trim().toLowerCase());
+  const normHeaders = rawHeaders.map((h) => h.replace(/[\s\-]+/g, '_'));
   const rows: Record<string, string>[] = [];
   const errors: Array<{ rowNumber: number; message: string }> = [];
 
@@ -116,22 +117,24 @@ export function parseCsv(rawCsvText: string): CsvParseResult {
     if (!line.trim()) continue;
 
     const values = splitCsvLine(line);
-    if (values.length !== headers.length) {
+    if (values.length !== rawHeaders.length) {
       errors.push({
         rowNumber: r + 1,
-        message: `Column count mismatch: expected ${headers.length} columns but found ${values.length}`
+        message: `Column count mismatch: expected ${rawHeaders.length} columns but found ${values.length}`
       });
       continue;
     }
 
     const rowObj: Record<string, string> = {};
-    for (let c = 0; c < headers.length; c++) {
-      rowObj[headers[c]] = values[c].trim();
+    for (let c = 0; c < rawHeaders.length; c++) {
+      const val = values[c].trim();
+      rowObj[rawHeaders[c]] = val;
+      rowObj[normHeaders[c]] = val;
     }
     rows.push(rowObj);
   }
 
-  return { headers, rows, errors };
+  return { headers: normHeaders, rows, errors };
 }
 
 function splitCsvLine(line: string): string[] {

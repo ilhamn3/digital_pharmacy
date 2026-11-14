@@ -1,23 +1,25 @@
 import { Pool, PoolClient } from 'pg';
-import { pool } from '../db/pool.js';
+import Decimal from 'decimal.js';
 
 export interface BatchAllocation {
   batchId: string;
   batchNo: string;
   expiryDate: string;
-  costPrice: number;
-  mrp: number;
-  allocatedQty: number;
-  currentQuantity: number;
+  costPrice: string;
+  mrp: string;
+  allocatedQty: string;
+  currentQuantity: string;
+  lineTotal: string;
+  cogs: string;
 }
 
 export interface FefoAllocationResult {
   success: boolean;
   productId: string;
-  requestedQuantity: number;
-  totalAllocated: number;
+  requestedQuantity: string;
+  totalAllocated: string;
   allocations: BatchAllocation[];
-  shortage?: number;
+  shortage?: string;
   message?: string;
 }
 
@@ -28,111 +30,122 @@ export interface BatchCandidate {
   cost_price: string;
   mrp: string;
   current_quantity: string;
-  is_expired: boolean;
 }
 
 /**
  * FEFO (First-Expired, First-Out) Allocation Engine
  * Selects sellable stock from active, non-expired batches ordered by nearest expiry date.
  * Splits a line item across multiple batches if a single batch cannot fulfill the requested quantity.
+ * Uses make_interval(days => $2::int) for interval arithmetic and Decimal for allocation math.
  */
 export async function allocateFefo(
   db: Pool | PoolClient,
   productId: string,
-  requestedQuantity: number,
-  options: { forUpdate?: boolean } = {}
+  requestedQuantity: string | number,
+  options: { forUpdate?: boolean; minShelfLifeDays?: number } = {}
 ): Promise<FefoAllocationResult> {
-  if (requestedQuantity <= 0) {
+  const reqQty = new Decimal(requestedQuantity);
+  if (reqQty.lte(0)) {
     throw new Error('Requested quantity must be greater than zero');
   }
 
-  // Query sellable batches: strictly active, non-expired, positive stock, ordered by expiry_date ASC
+  const minShelfLife = Math.max(0, options.minShelfLifeDays || 0);
   const forUpdateClause = options.forUpdate ? 'FOR UPDATE' : '';
+
+  // Query sellable batches: strictly active, non-expired (with min shelf life), positive stock, ordered by expiry_date ASC, id ASC
+  // Uses make_interval(days => $2::int) instead of string concatenation
   const query = `
     SELECT 
       id,
       batch_no,
       expiry_date::text,
-      cost_price,
-      mrp,
-      current_quantity,
-      (expiry_date < CURRENT_DATE) as is_expired
+      cost_price::text,
+      mrp::text,
+      current_quantity::text
     FROM batches
     WHERE product_id = $1 
       AND is_active = true 
       AND current_quantity > 0
-      AND expiry_date >= CURRENT_DATE
-    ORDER BY expiry_date ASC, created_at ASC
+      AND expiry_date >= CURRENT_DATE + make_interval(days => $2::int)
+    ORDER BY expiry_date ASC, id ASC
     ${forUpdateClause}
   `;
 
-  const result = await db.query(query, [productId]);
+  const result = await db.query(query, [productId, minShelfLife]);
   const candidates: BatchCandidate[] = result.rows;
 
-  let totalAvailable = 0;
+  let totalAvailable = new Decimal(0);
   for (const c of candidates) {
-    totalAvailable += parseFloat(c.current_quantity);
+    totalAvailable = totalAvailable.plus(new Decimal(c.current_quantity));
   }
 
-  if (totalAvailable < requestedQuantity) {
+  if (totalAvailable.lt(reqQty)) {
     return {
       success: false,
       productId,
-      requestedQuantity,
-      totalAllocated: 0,
+      requestedQuantity: reqQty.toFixed(2),
+      totalAllocated: '0.00',
       allocations: [],
-      shortage: requestedQuantity - totalAvailable,
-      message: `Insufficient non-expired stock. Requested ${requestedQuantity}, but only ${totalAvailable} available across active batches.`
+      shortage: reqQty.minus(totalAvailable).toFixed(2),
+      message: `Insufficient non-expired stock. Requested ${reqQty.toFixed(2)}, but only ${totalAvailable.toFixed(2)} available across active batches.`
     };
   }
 
   const allocations: BatchAllocation[] = [];
-  let remainingToAllocate = requestedQuantity;
+  let remainingToAllocate = new Decimal(reqQty);
 
   for (const c of candidates) {
-    if (remainingToAllocate <= 0) break;
+    if (remainingToAllocate.lte(0)) break;
 
-    const availableInBatch = parseFloat(c.current_quantity);
-    const allocateFromThis = Math.min(remainingToAllocate, availableInBatch);
+    const availableInBatch = new Decimal(c.current_quantity);
+    const allocateFromThis = Decimal.min(remainingToAllocate, availableInBatch);
+
+    const costPriceDec = new Decimal(c.cost_price);
+    const mrpDec = new Decimal(c.mrp);
+    const lineTotalDec = allocateFromThis.times(mrpDec).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+    const cogsDec = allocateFromThis.times(costPriceDec).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
 
     allocations.push({
       batchId: c.id,
       batchNo: c.batch_no,
       expiryDate: c.expiry_date,
-      costPrice: parseFloat(c.cost_price),
-      mrp: parseFloat(c.mrp),
-      allocatedQty: allocateFromThis,
-      currentQuantity: availableInBatch
+      costPrice: c.cost_price,
+      mrp: c.mrp,
+      allocatedQty: allocateFromThis.toFixed(2),
+      currentQuantity: c.current_quantity,
+      lineTotal: lineTotalDec.toFixed(2),
+      cogs: cogsDec.toFixed(4)
     });
 
-    remainingToAllocate -= allocateFromThis;
+    remainingToAllocate = remainingToAllocate.minus(allocateFromThis);
   }
 
   return {
     success: true,
     productId,
-    requestedQuantity,
-    totalAllocated: requestedQuantity - remainingToAllocate,
+    requestedQuantity: reqQty.toFixed(2),
+    totalAllocated: reqQty.minus(remainingToAllocate).toFixed(2),
     allocations
   };
 }
 
 /**
- * Reconciles batch stock: asserts SUM(qty_change) from stock_movements equals current_quantity.
+ * Reconciles batch stock: asserts SUM(qty_change) from stock_movements equals current_quantity strictly in SQL.
  */
 export async function reconcileBatchStock(db: Pool | PoolClient, batchId: string): Promise<{
   batchId: string;
   batchNo: string;
-  currentQuantity: number;
-  movementSum: number;
+  currentQuantity: string;
+  movementSum: string;
   reconciled: boolean;
 }> {
   const query = `
     SELECT 
       b.id as batch_id,
       b.batch_no,
-      b.current_quantity,
-      COALESCE(SUM(sm.qty_change), 0.00)::NUMERIC(12,2) as movement_sum
+      b.current_quantity::text as current_quantity,
+      COALESCE(SUM(sm.qty_change), 0.00)::NUMERIC(12,2)::text as movement_sum,
+      (b.current_quantity = COALESCE(SUM(sm.qty_change), 0.00)) as reconciled
     FROM batches b
     LEFT JOIN stock_movements sm ON b.id = sm.batch_id
     WHERE b.id = $1
@@ -145,14 +158,12 @@ export async function reconcileBatchStock(db: Pool | PoolClient, batchId: string
   }
 
   const row = res.rows[0];
-  const currentQuantity = parseFloat(row.current_quantity);
-  const movementSum = parseFloat(row.movement_sum);
 
   return {
     batchId: row.batch_id,
     batchNo: row.batch_no,
-    currentQuantity,
-    movementSum,
-    reconciled: currentQuantity === movementSum
+    currentQuantity: row.current_quantity,
+    movementSum: row.movement_sum,
+    reconciled: Boolean(row.reconciled)
   };
 }

@@ -4,16 +4,12 @@ import { verifyAccessToken } from '../utils/crypto.js';
 import { AuthenticatedRequest } from '../types/auth.js';
 
 export function getClientIp(req: AuthenticatedRequest): string {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string') {
-    return forwarded.split(',')[0].trim();
-  }
-  return req.socket.remoteAddress || '127.0.0.1';
+  return req.ip || '127.0.0.1';
 }
 
 /**
  * Validates JWT access token, enforces active account status,
- * lockout checks, and must_change_password constraints.
+ * and must_change_password constraints.
  */
 export async function authenticate(req: AuthenticatedRequest, res: Response, next: NextFunction) {
   const authHeader = req.headers.authorization;
@@ -32,7 +28,7 @@ export async function authenticate(req: AuthenticatedRequest, res: Response, nex
 
     // Verify user status in DB
     const userRes = await pool.query(
-      `SELECT id, username, full_name, role, is_active, must_change_password, locked_until
+      `SELECT id, username, full_name, role, is_active, must_change_password
        FROM users
        WHERE id = $1`,
       [payload.sub]
@@ -54,14 +50,6 @@ export async function authenticate(req: AuthenticatedRequest, res: Response, nex
       });
     }
 
-    // Check account lockout
-    if (dbUser.locked_until && new Date(dbUser.locked_until) > new Date()) {
-      return res.status(403).json({
-        error: 'ACCOUNT_LOCKED',
-        message: `Account temporarily locked due to failed login attempts until ${new Date(dbUser.locked_until).toISOString()}`
-      });
-    }
-
     req.user = {
       id: dbUser.id,
       username: dbUser.username,
@@ -72,17 +60,16 @@ export async function authenticate(req: AuthenticatedRequest, res: Response, nex
     };
 
     // If user is required to change password, allow only change-password, me, and logout endpoints
+    // Using exact match on req.originalUrl without query string
     if (req.user.mustChangePassword) {
-      const allowedPaths = [
+      const urlPath = req.originalUrl.split('?')[0];
+      const allowedPaths = new Set([
         '/api/v1/auth/change-password',
         '/api/v1/auth/me',
         '/api/v1/auth/logout'
-      ];
+      ]);
 
-      const currentPath = req.baseUrl + req.path;
-      const isAllowed = allowedPaths.some((p) => currentPath.endsWith(p) || req.path === '/change-password' || req.path === '/me' || req.path === '/logout');
-
-      if (!isAllowed) {
+      if (!allowedPaths.has(urlPath)) {
         return res.status(403).json({
           error: 'PASSWORD_CHANGE_REQUIRED',
           message: 'You must change your temporary password before accessing other system resources.'

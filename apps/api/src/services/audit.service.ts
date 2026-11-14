@@ -1,5 +1,6 @@
 import { PoolClient } from 'pg';
 import { pool } from '../db/pool.js';
+import net from 'net';
 
 export interface AuditLogEntry {
   userId?: string | null;
@@ -12,42 +13,56 @@ export interface AuditLogEntry {
   client?: PoolClient;
 }
 
-const SENSITIVE_KEYS = new Set([
-  'password',
-  'password_hash',
-  'passwordhash',
-  'oldpassword',
-  'newpassword',
-  'confirmpassword',
-  'token',
-  'refreshtoken',
-  'rawtoken',
-  'secret',
-  'jwt_access_secret',
-  'jwt_refresh_secret'
+export const MONEY_MUTATION_ACTIONS = new Set([
+  'SALE_CREATED',
+  'SALE_VOIDED',
+  'PURCHASE_CREATED',
+  'PURCHASE_VOIDED',
+  'PAYMENT_RECEIVED',
+  'SUPPLIER_PAYMENT_CREATED',
+  'CUSTOMER_PAYMENT_CREATED',
+  'STOCK_ADJUSTED',
+  'STOCK_ADJUSTMENT_CREATED',
+  'SALES_RETURN_CREATED',
+  'SUPPLIER_RETURN_CREATED'
 ]);
 
+const SENSITIVE_KEY_PATTERN = /(password|token|secret|apikey|authorization|cookie)/i;
+
 /**
- * Deeply sanitizes an object to ensure no passwords or secrets are ever recorded in audit trails.
+ * Deeply sanitizes an object to ensure no sensitive credentials or keys are recorded in audit trails.
+ * Normalizes keys by stripping hyphens, underscores, and lowercasing.
+ * Handles BigInt conversions and enforces a recursion depth limit.
  */
-export function sanitizeForAudit(obj: any): any {
+export function sanitizeForAudit(obj: any, depth = 0, maxDepth = 10): any {
   if (obj === null || obj === undefined) return obj;
+
+  if (typeof obj === 'bigint') {
+    return obj.toString();
+  }
 
   if (typeof obj !== 'object') {
     return obj;
   }
 
+  if (depth > maxDepth) {
+    return '[MAX_DEPTH_EXCEEDED]';
+  }
+
   if (Array.isArray(obj)) {
-    return obj.map(sanitizeForAudit);
+    return obj.map((item) => sanitizeForAudit(item, depth + 1, maxDepth));
   }
 
   const sanitized: Record<string, any> = {};
   for (const [key, val] of Object.entries(obj)) {
-    const lowerKey = key.toLowerCase();
-    if (SENSITIVE_KEYS.has(lowerKey)) {
+    const normalizedKey = key.toLowerCase().replace(/[-_]/g, '');
+
+    if (SENSITIVE_KEY_PATTERN.test(normalizedKey)) {
       sanitized[key] = '[REDACTED]';
+    } else if (typeof val === 'bigint') {
+      sanitized[key] = val.toString();
     } else if (typeof val === 'object' && val !== null) {
-      sanitized[key] = sanitizeForAudit(val);
+      sanitized[key] = sanitizeForAudit(val, depth + 1, maxDepth);
     } else {
       sanitized[key] = val;
     }
@@ -57,11 +72,28 @@ export function sanitizeForAudit(obj: any): any {
 }
 
 /**
+ * Validates an IP address using Node net module (IPv4 and IPv6).
+ * Returns normalized string or null if invalid.
+ */
+export function validateIpAddress(ip?: string | null): string | null {
+  if (!ip || typeof ip !== 'string') return null;
+  const trimmed = ip.trim();
+  return net.isIP(trimmed) !== 0 ? trimmed : null;
+}
+
+/**
  * Persists an immutable audit log row.
+ * For money mutations, a transaction PoolClient is strictly required.
  */
 export async function logAudit(entry: AuditLogEntry): Promise<void> {
+  // Make client mandatory for money mutations
+  if (MONEY_MUTATION_ACTIONS.has(entry.action) && !entry.client) {
+    throw new Error(`Database client (PoolClient) is mandatory for transactional money audit log: ${entry.action}`);
+  }
+
   const sanitizedBefore = entry.beforeState !== undefined ? JSON.stringify(sanitizeForAudit(entry.beforeState)) : null;
   const sanitizedAfter = entry.afterState !== undefined ? JSON.stringify(sanitizeForAudit(entry.afterState)) : null;
+  const validatedIp = validateIpAddress(entry.ipAddress);
 
   const query = `
     INSERT INTO audit_logs (
@@ -78,7 +110,7 @@ export async function logAudit(entry: AuditLogEntry): Promise<void> {
     String(entry.entityId),
     sanitizedBefore,
     sanitizedAfter,
-    entry.ipAddress || null
+    validatedIp
   ];
 
   if (entry.client) {
@@ -88,3 +120,9 @@ export async function logAudit(entry: AuditLogEntry): Promise<void> {
   }
 }
 
+/**
+ * Convenience helper to log audit within an existing database transaction client
+ */
+export async function logAuditWithClient(client: PoolClient, entry: Omit<AuditLogEntry, 'client'>): Promise<void> {
+  return logAudit({ ...entry, client });
+}

@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "migrate": "node-pg-migrate -m migrations --envPath ../.env up",
-    "migrate:down": "node-pg-migrate -m migrations --envPath ../.env down",
+    "migrate": "node-pg-migrate -m migrations --envPath ../.env -d MIGRATION_DATABASE_URL up",
+    "migrate:down": "node-pg-migrate -m migrations --envPath ../.env -d MIGRATION_DATABASE_URL down",
     "migrate:create": "node-pg-migrate --migration-file-language sql -m migrations create",
+    "setup-role": "tsx scripts/setup-app-role.ts",
     "seed": "tsx seeds/seed.ts",
     "seed:reference": "tsx seeds/reference.ts",
     "seed:demo": "tsx seeds/demo.ts",

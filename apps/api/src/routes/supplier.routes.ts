@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { pool } from '../db/pool.js';
 import { authenticate, getClientIp } from '../middleware/auth.js';
 import { requireRoles } from '../middleware/rbac.js';
-import { logAudit } from '../services/audit.service.js';
+import { logAudit, logAuditWithClient } from '../services/audit.service.js';
 import { AuthenticatedRequest } from '../types/auth.js';
 
 const router = Router();
@@ -304,6 +304,123 @@ router.patch('/:id/status', async (req: AuthenticatedRequest, res: Response) => 
   } catch (error) {
     console.error('Supplier status error:', error);
     return res.status(500).json({ error: 'INTERNAL_ERROR', message: 'Failed to toggle supplier status' });
+  }
+});
+
+const supplierPaymentSchema = z.object({
+  amount: z.number().positive('Payment amount must be greater than 0'),
+  paymentMethod: z.enum(['cash', 'bank_transfer', 'cheque']),
+  referenceNo: z.string().optional().nullable(),
+  notes: z.string().optional().nullable(),
+  allowOverpayment: z.boolean().optional().default(false)
+});
+
+/**
+ * POST /api/v1/suppliers/:id/payments
+ * Settle supplier balance in ONE atomic DB transaction
+ */
+router.post('/:id/payments', async (req: AuthenticatedRequest, res: Response) => {
+  const supplierId = String(req.params.id);
+  const ipAddress = getClientIp(req);
+  const parseResult = supplierPaymentSchema.safeParse(req.body);
+
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'VALIDATION_ERROR',
+      details: parseResult.error.format()
+    });
+  }
+
+  const { amount, paymentMethod, referenceNo, notes, allowOverpayment } = parseResult.data;
+  const userId = req.user!.id;
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // 1. Lock supplier
+    const supRes = await client.query(
+      `SELECT id, name, outstanding_balance FROM suppliers WHERE id = $1 FOR UPDATE`,
+      [supplierId]
+    );
+
+    if (supRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'Supplier not found' });
+    }
+
+    const supplier = supRes.rows[0];
+    const prevBalance = Number(supplier.outstanding_balance);
+    const balanceAfter = Math.round((prevBalance - amount) * 100) / 100;
+
+    // Check negative balance
+    if (balanceAfter < 0 && !allowOverpayment) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: 'OVERPAYMENT_NOT_ALLOWED',
+        message: `Payment of Rs. ${amount.toFixed(2)} exceeds outstanding balance of Rs. ${prevBalance.toFixed(2)}. Set allowOverpayment to true to record an advance or overpayment.`
+      });
+    }
+
+    // 2. Insert into supplier_payments
+    const payRes = await client.query(
+      `INSERT INTO supplier_payments (
+         supplier_id, amount, payment_method, reference_no, notes, paid_by
+       ) VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, amount, payment_method, reference_no, notes, created_at`,
+      [supplierId, amount, paymentMethod, referenceNo || null, notes || null, userId]
+    );
+    const payment = payRes.rows[0];
+
+    // 3. Insert into supplier_ledger (payment reduces payable: negative amount)
+    await client.query(
+      `INSERT INTO supplier_ledger (
+         supplier_id, entry_type, amount, balance_after, ref_type, ref_id, created_by
+       ) VALUES ($1, 'payment', $2, $3, 'supplier_payment', $4, $5)`,
+      [supplierId, -amount, balanceAfter, payment.id, userId]
+    );
+
+    // 4. Audit log in same transaction
+    await logAuditWithClient(client, {
+      userId,
+      action: 'SUPPLIER_PAYMENT_CREATED',
+      entity: 'SUPPLIER_PAYMENT',
+      entityId: payment.id,
+      beforeState: { outstandingBalance: prevBalance },
+      afterState: {
+        paymentId: payment.id,
+        amount,
+        paymentMethod,
+        referenceNo,
+        balanceAfter
+      },
+      ipAddress
+    });
+
+    await client.query('COMMIT');
+
+    return res.status(201).json({
+      message: 'Supplier payment recorded successfully',
+      payment: {
+        id: payment.id,
+        supplierId,
+        supplierName: supplier.name,
+        amount: payment.amount,
+        paymentMethod: payment.payment_method,
+        referenceNo: payment.reference_no,
+        notes: payment.notes,
+        previousBalance: prevBalance,
+        newBalance: balanceAfter,
+        createdAt: payment.created_at
+      }
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Supplier payment error:', error);
+    return res.status(500).json({ error: 'INTERNAL_ERROR', message: 'Failed to record supplier payment' });
+  } finally {
+    client.release();
   }
 });
 

@@ -129,8 +129,8 @@ describe('Step 2: Auth, Users, Roles & Audit Middleware Tests', () => {
         [testUser, hash]
       );
 
-      // Perform 3 rapid failed attempts
-      for (let i = 0; i < 3; i++) {
+      // Perform 5 failed attempts
+      for (let i = 0; i < 5; i++) {
         const res = await fetch(`${baseUrl}/api/v1/auth/login`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -140,7 +140,7 @@ describe('Step 2: Auth, Users, Roles & Audit Middleware Tests', () => {
       }
 
       const check = await pool.query('SELECT failed_login_count, locked_until FROM users WHERE username = $1', [testUser]);
-      expect(check.rows[0].failed_login_count).toBe(3);
+      expect(check.rows[0].failed_login_count).toBe(5);
       expect(check.rows[0].locked_until).not.toBeNull();
     });
   });
@@ -176,7 +176,13 @@ describe('Step 2: Auth, Users, Roles & Audit Middleware Tests', () => {
       expect(secondCookie).toBeTruthy();
       expect(secondCookie).not.toBe(initialCookie);
 
-      // 3. MALICIOUS REUSE: Replay the initial (already rotated/revoked) refresh token
+      // 3. MALICIOUS REUSE: Backdate revoked_at of initial token past the 15-second grace window (20 seconds ago)
+      const { hashToken } = await import('../src/utils/crypto.js');
+      await pool.query(
+        "UPDATE refresh_tokens SET revoked_at = NOW() - INTERVAL '20 seconds' WHERE token_hash = $1",
+        [hashToken(initialCookie!)]
+      );
+
       const reuseRes = await fetch(`${baseUrl}/api/v1/auth/refresh`, {
         method: 'POST',
         headers: {

@@ -1,5 +1,6 @@
 import { Router, Response } from 'express';
 import { z } from 'zod';
+import rateLimit from 'express-rate-limit';
 import { pool } from '../db/pool.js';
 import { env } from '../config/env.js';
 import {
@@ -15,6 +16,56 @@ import { AuthenticatedRequest } from '../types/auth.js';
 
 const router = Router();
 
+// Rate limiting on login route (10 attempts / 15 min per IP + lower(username))
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: (req) => {
+    if (process.env.NODE_ENV === 'test' && !req.headers['x-enforce-rate-limit']) {
+      return 1000;
+    }
+    return 10;
+  },
+  keyGenerator: (req) => {
+    const ip = getClientIp(req);
+    const username = (req.body?.username || '').toString().toLowerCase().trim();
+    return `${ip}_${username}`;
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'RATE_LIMIT_EXCEEDED',
+    message: 'Too many login attempts. Please try again later.'
+  }
+});
+
+interface ProgressiveDelayTracker {
+  count: number;
+  lastAttempt: number;
+}
+const progressiveDelayMap = new Map<string, ProgressiveDelayTracker>();
+
+export function getProgressiveDelay(ip: string, username: string): number {
+  const key = `${ip}_${username.toLowerCase().trim()}`;
+  const now = Date.now();
+  const entry = progressiveDelayMap.get(key);
+
+  if (!entry || (now - entry.lastAttempt > 15 * 60 * 1000)) {
+    progressiveDelayMap.set(key, { count: 1, lastAttempt: now });
+    return 0;
+  }
+
+  entry.count += 1;
+  entry.lastAttempt = now;
+  // Delay increases by 200ms per subsequent failure, capped at 2000ms (2s)
+  const delayMs = Math.min((entry.count - 1) * 200, 2000);
+  return delayMs;
+}
+
+export function clearProgressiveDelay(ip: string, username: string): void {
+  const key = `${ip}_${username.toLowerCase().trim()}`;
+  progressiveDelayMap.delete(key);
+}
+
 const loginSchema = z.object({
   username: z.string().min(1, 'Username is required'),
   password: z.string().min(1, 'Password is required')
@@ -22,30 +73,11 @@ const loginSchema = z.object({
 
 const changePasswordSchema = z.object({
   oldPassword: z.string().min(1, 'Current password is required'),
-  newPassword: z.string().min(8, 'New password must be at least 8 characters long')
+  newPassword: z.string().min(8, 'New password must be at least 8 characters long').max(72, 'Password must not exceed 72 characters')
 });
 
-const refreshSchema = z.object({
-  refreshToken: z.string().optional()
-});
-
-// Progressive delay & rate-limiting maps
-const ipRateLimitMap = new Map<string, { count: number; resetAt: number }>();
-const failureAttemptsMap = new Map<string, { attempts: number; resetAt: number }>();
-const MAX_LOGIN_REQUESTS_PER_MINUTE = 60;
-// Constant dummy bcrypt hash for timing equivalence when user is not found
+// Constant dummy bcrypt hash for timing equivalence on non-existent users
 const DUMMY_HASH = '$2a$10$abcdefghijklmnopqrstuvwxyz123456789012345678901234567890';
-
-function checkIpRateLimit(ip: string): boolean {
-  const now = Date.now();
-  const entry = ipRateLimitMap.get(ip);
-  if (!entry || now > entry.resetAt) {
-    ipRateLimitMap.set(ip, { count: 1, resetAt: now + 60 * 1000 });
-    return true;
-  }
-  entry.count++;
-  return entry.count <= MAX_LOGIN_REQUESTS_PER_MINUTE;
-}
 
 /**
  * Helper to set secure httpOnly refresh cookie
@@ -63,17 +95,8 @@ function setRefreshCookie(res: Response, token: string) {
 /**
  * POST /api/v1/auth/login
  */
-router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
+router.post('/login', loginLimiter, async (req: AuthenticatedRequest, res: Response) => {
   const ipAddress = getClientIp(req);
-
-  // Per-IP rate limiting
-  if (!checkIpRateLimit(ipAddress)) {
-    return res.status(429).json({
-      error: 'RATE_LIMIT_EXCEEDED',
-      message: 'Too many login attempts from this IP address. Please try again later.'
-    });
-  }
-
   const parseResult = loginSchema.safeParse(req.body);
 
   if (!parseResult.success) {
@@ -89,24 +112,26 @@ router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
     const userRes = await pool.query(
       `SELECT id, username, email, password_hash, full_name, role, is_active, must_change_password, failed_login_count, locked_until
        FROM users
-       WHERE username = $1`,
+       WHERE lower(username) = lower($1)`,
       [username]
     );
 
+    // 1. Unknown user: timing equivalence & audit log
     if (userRes.rows.length === 0) {
-      // Timing equivalence: run bcrypt comparison against dummy hash
       await comparePassword(password, DUMMY_HASH);
-
-      const failureKey = `${username.toLowerCase()}_${ipAddress}`;
-      const now = Date.now();
-      const entry = failureAttemptsMap.get(failureKey);
-      const attempts = entry && now < entry.resetAt ? entry.attempts + 1 : 1;
-      failureAttemptsMap.set(failureKey, { attempts, resetAt: now + 15 * 60 * 1000 });
-
-      const delayMs = Math.min(Math.max(0, (attempts - 1) * 200), 2000);
-      if (delayMs > 0) {
-        await new Promise((r) => setTimeout(r, delayMs));
+      const delay = getProgressiveDelay(ipAddress, username);
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
+
+      await logAudit({
+        userId: null,
+        action: 'LOGIN_FAILED',
+        entity: 'USER',
+        entityId: username.toLowerCase(),
+        afterState: { attemptedUsername: username, reason: 'UNKNOWN_USER' },
+        ipAddress
+      });
 
       return res.status(401).json({
         error: 'INVALID_CREDENTIALS',
@@ -116,12 +141,12 @@ router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
 
     const user = userRes.rows[0];
 
-    // Check account lockout or progressive delay window
+    // 2. Locked user: timing equivalence & identical 401
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
-      const remainingMs = Math.min(new Date(user.locked_until).getTime() - Date.now(), 2000);
       await comparePassword(password, DUMMY_HASH);
-      if (remainingMs > 0) {
-        await new Promise((r) => setTimeout(r, remainingMs));
+      const delay = getProgressiveDelay(ipAddress, username);
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
       return res.status(401).json({
         error: 'INVALID_CREDENTIALS',
@@ -129,26 +154,37 @@ router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
       });
     }
 
+    // 3. Deactivated user: timing equivalence & identical 401
     if (!user.is_active) {
-      return res.status(403).json({
-        error: 'ACCOUNT_DEACTIVATED',
-        message: 'This account has been deactivated. Contact an administrator.'
+      await comparePassword(password, DUMMY_HASH);
+      const delay = getProgressiveDelay(ipAddress, username);
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      return res.status(401).json({
+        error: 'INVALID_CREDENTIALS',
+        message: 'Invalid username or password'
       });
     }
 
-    // Verify password
+    // 4. Verify password
     const isPasswordValid = await comparePassword(password, user.password_hash);
     if (!isPasswordValid) {
-      const attempts = (user.failed_login_count || 0) + 1;
-      const delayMs = Math.min(Math.max(0, (attempts - 1) * 200), 2000);
-      const lockedUntil = delayMs > 0 ? new Date(Date.now() + delayMs) : null;
-
-      await pool.query(
+      // Atomic UPDATE for failed_login_count and locked_until
+      const updateRes = await pool.query(
         `UPDATE users
-         SET failed_login_count = $1, locked_until = $2, updated_at = NOW()
-         WHERE id = $3`,
-        [attempts, lockedUntil, user.id]
+         SET failed_login_count = failed_login_count + 1,
+             locked_until = CASE 
+               WHEN failed_login_count + 1 >= 5 THEN NOW() + INTERVAL '15 minutes'
+               ELSE NULL 
+             END,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING failed_login_count, locked_until`,
+        [user.id]
       );
+
+      const updated = updateRes.rows[0];
 
       await logAudit({
         userId: user.id,
@@ -156,12 +192,13 @@ router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
         entity: 'USER',
         entityId: user.id,
         beforeState: { attemptsBefore: user.failed_login_count },
-        afterState: { attemptsAfter: attempts, lockedUntil },
+        afterState: { attemptsAfter: updated.failed_login_count, lockedUntil: updated.locked_until },
         ipAddress
       });
 
-      if (delayMs > 0) {
-        await new Promise((r) => setTimeout(r, delayMs));
+      const delay = getProgressiveDelay(ipAddress, username);
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
 
       return res.status(401).json({
@@ -170,7 +207,8 @@ router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
       });
     }
 
-    // Reset failed attempts on success and record last_login_at
+    // Reset failed attempts on success, clear progressive delay, and record last_login_at
+    clearProgressiveDelay(ipAddress, username);
     await pool.query(
       `UPDATE users
        SET failed_login_count = 0, locked_until = NULL, last_login_at = NOW(), updated_at = NOW()
@@ -226,7 +264,8 @@ router.post('/login', async (req: AuthenticatedRequest, res: Response) => {
 
 /**
  * POST /api/v1/auth/refresh
- * Implements Token Rotation and Automatic Reuse Detection
+ * Implements atomic token rotation, 15-second concurrent tab grace window,
+ * and malicious reuse detection.
  */
 router.post('/refresh', async (req: AuthenticatedRequest, res: Response) => {
   const ipAddress = getClientIp(req);
@@ -240,10 +279,83 @@ router.post('/refresh', async (req: AuthenticatedRequest, res: Response) => {
   }
 
   const tokenHashed = hashToken(rawRefreshToken);
+  const client = await pool.connect();
 
   try {
-    const tokenRes = await pool.query(
-      `SELECT rt.id, rt.user_id, rt.expires_at, rt.revoked_at, rt.family_id,
+    await client.query('BEGIN');
+
+    // 1. Try atomic rotation of an unrevoked token
+    const newRefreshToken = generateRefreshToken();
+    const newTokenHashed = hashToken(newRefreshToken);
+    const newExpiresAt = new Date(Date.now() + env.JWT_REFRESH_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+    const userAgent = (req.headers['user-agent'] as string) || null;
+
+    const rotateRes = await client.query(
+      `UPDATE refresh_tokens
+       SET revoked_at = NOW(), replaced_by = $1
+       WHERE token_hash = $2 AND revoked_at IS NULL
+       RETURNING id, user_id, expires_at, family_id`,
+      [newTokenHashed, tokenHashed]
+    );
+
+    if (rotateRes.rows.length > 0) {
+      const rotated = rotateRes.rows[0];
+
+      // Expiry check
+      if (new Date(rotated.expires_at) < new Date()) {
+        await client.query('ROLLBACK');
+        return res.status(401).json({
+          error: 'REFRESH_TOKEN_EXPIRED',
+          message: 'Refresh token has expired'
+        });
+      }
+
+      // Check user status
+      const userRes = await client.query(
+        `SELECT id, username, full_name, role, is_active, must_change_password
+         FROM users WHERE id = $1`,
+        [rotated.user_id]
+      );
+
+      if (userRes.rows.length === 0 || !userRes.rows[0].is_active) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({
+          error: 'ACCOUNT_DEACTIVATED',
+          message: 'User account is inactive'
+        });
+      }
+
+      const user = userRes.rows[0];
+
+      // Insert new token preserving family_id
+      await client.query(
+        `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id, ip_address, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [user.id, newTokenHashed, newExpiresAt, rotated.family_id, ipAddress, userAgent]
+      );
+
+      await client.query('COMMIT');
+
+      setRefreshCookie(res, newRefreshToken);
+
+      const authUser = {
+        id: user.id,
+        username: user.username,
+        fullName: user.full_name,
+        role: user.role,
+        isActive: user.is_active,
+        mustChangePassword: user.must_change_password
+      };
+
+      return res.json({
+        accessToken: generateAccessToken(authUser),
+        user: authUser
+      });
+    }
+
+    // 2. Token is already revoked or does not exist
+    const tokenRes = await client.query(
+      `SELECT rt.id, rt.user_id, rt.expires_at, rt.revoked_at, rt.family_id, rt.replaced_by,
               u.id as user_id, u.username, u.full_name, u.role, u.is_active, u.must_change_password
        FROM refresh_tokens rt
        JOIN users u ON rt.user_id = u.id
@@ -252,6 +364,7 @@ router.post('/refresh', async (req: AuthenticatedRequest, res: Response) => {
     );
 
     if (tokenRes.rows.length === 0) {
+      await client.query('ROLLBACK');
       return res.status(401).json({
         error: 'INVALID_REFRESH_TOKEN',
         message: 'Refresh token not recognized'
@@ -259,102 +372,72 @@ router.post('/refresh', async (req: AuthenticatedRequest, res: Response) => {
     }
 
     const tokenRow = tokenRes.rows[0];
+    const revokedAt = new Date(tokenRow.revoked_at);
+    const secondsSinceRevocation = (Date.now() - revokedAt.getTime()) / 1000;
 
-    // REUSE DETECTION: If an already-revoked token is presented, trigger compromise defense!
-    if (tokenRow.revoked_at !== null) {
-      // Invalidate ALL refresh tokens in the family / for this user
-      await pool.query(
-        `UPDATE refresh_tokens
-         SET revoked_at = NOW()
-         WHERE (family_id = $1 OR user_id = $2) AND revoked_at IS NULL`,
-        [tokenRow.family_id, tokenRow.user_id]
-      );
+    // Grace Window: ONLY for a token that was legitimately rotated (replaced_by IS NOT NULL) within the last 15 seconds
+    if (Boolean(tokenRow.replaced_by) && secondsSinceRevocation <= 15) {
+      await client.query('COMMIT');
 
-      await logAudit({
-        userId: tokenRow.user_id,
-        action: 'TOKEN_REUSE_DETECTED',
-        entity: 'SECURITY',
-        entityId: tokenRow.user_id,
-        afterState: { familyId: tokenRow.family_id, revokedAllTokensForUser: true },
-        ipAddress
-      });
+      const authUser = {
+        id: tokenRow.user_id,
+        username: tokenRow.username,
+        fullName: tokenRow.full_name,
+        role: tokenRow.role,
+        isActive: tokenRow.is_active,
+        mustChangePassword: tokenRow.must_change_password
+      };
 
-      res.clearCookie('refreshToken', { path: '/api/v1/auth' });
-      return res.status(403).json({
-        error: 'TOKEN_REUSE_COMPROMISED',
-        message: 'Security violation: Refresh token reuse detected. All active sessions have been invalidated.'
+      // Return a fresh access token without invalidating sessions or forking family
+      return res.json({
+        accessToken: generateAccessToken(authUser),
+        user: authUser
       });
     }
 
-    // Expiry check
-    if (new Date(tokenRow.expires_at) < new Date()) {
-      return res.status(401).json({
-        error: 'REFRESH_TOKEN_EXPIRED',
-        message: 'Refresh token has expired. Please log in again.'
-      });
-    }
-
-    if (!tokenRow.is_active) {
-      return res.status(403).json({
-        error: 'ACCOUNT_DEACTIVATED',
-        message: 'User account is inactive'
-      });
-    }
-
-    // Generate new token and link replaced_by
-    const newRefreshToken = generateRefreshToken();
-    const newTokenHashed = hashToken(newRefreshToken);
-
-    await pool.query(
+    // 3. Real reuse attack (> 15 seconds since revocation): Trigger compromise defense!
+    await client.query(
       `UPDATE refresh_tokens
-       SET revoked_at = NOW(), replaced_by = $1
-       WHERE id = $2`,
-      [newTokenHashed, tokenRow.id]
+       SET revoked_at = NOW()
+       WHERE family_id = $1 AND revoked_at IS NULL`,
+      [tokenRow.family_id]
     );
 
-    // Issue new token pair preserving family_id
-    const authUser = {
-      id: tokenRow.user_id,
-      username: tokenRow.username,
-      fullName: tokenRow.full_name,
-      role: tokenRow.role,
-      isActive: tokenRow.is_active,
-      mustChangePassword: tokenRow.must_change_password
-    };
+    await logAudit({
+      userId: tokenRow.user_id,
+      action: 'TOKEN_REUSE_DETECTED',
+      entity: 'SECURITY',
+      entityId: tokenRow.user_id,
+      afterState: { familyId: tokenRow.family_id, revokedAllTokensForUser: true },
+      ipAddress,
+      client
+    });
 
-    const newAccessToken = generateAccessToken(authUser);
-    const newExpiresAt = new Date(Date.now() + env.JWT_REFRESH_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
-    const userAgent = (req.headers['user-agent'] as string) || null;
+    await client.query('COMMIT');
 
-    await pool.query(
-      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, family_id, ip_address, user_agent)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [tokenRow.user_id, newTokenHashed, newExpiresAt, tokenRow.family_id, ipAddress, userAgent]
-    );
-
-    setRefreshCookie(res, newRefreshToken);
-
-    return res.json({
-      accessToken: newAccessToken,
-      user: authUser
+    res.clearCookie('refreshToken', { path: '/api/v1/auth' });
+    return res.status(403).json({
+      error: 'TOKEN_REUSE_COMPROMISED',
+      message: 'Security violation: Refresh token reuse detected. All active sessions have been invalidated.'
     });
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Refresh error:', error);
     return res.status(500).json({
       error: 'INTERNAL_ERROR',
       message: 'Failed to refresh authentication token'
     });
+  } finally {
+    client.release();
   }
 });
 
 /**
  * POST /api/v1/auth/logout
  */
-router.post('/logout', async (req: AuthenticatedRequest, res: Response) => {
+router.post('/logout', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const ipAddress = getClientIp(req);
-  const tokenFromCookie = req.cookies?.refreshToken;
-  const tokenFromBody = req.body?.refreshToken;
-  const rawRefreshToken = tokenFromCookie || tokenFromBody;
+  const rawRefreshToken = req.cookies?.refreshToken;
 
   if (rawRefreshToken) {
     const tokenHashed = hashToken(rawRefreshToken);
@@ -383,7 +466,7 @@ router.post('/logout', async (req: AuthenticatedRequest, res: Response) => {
 
 /**
  * POST /api/v1/auth/change-password
- * Handles mandatory password change on bootstrap / temporary password
+ * Password policy: 8-72 characters, new != old
  */
 router.post('/change-password', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const ipAddress = getClientIp(req);
@@ -399,18 +482,34 @@ router.post('/change-password', authenticate, async (req: AuthenticatedRequest, 
   const { oldPassword, newPassword } = parseResult.data;
   const userId = req.user!.id;
 
-  try {
-    const userRes = await pool.query(
-      `SELECT password_hash, username, full_name, role, is_active FROM users WHERE id = $1`,
-      [userId]
-    );
-    const user = userRes.rows[0];
+  // New password must not be identical to old password
+  if (oldPassword === newPassword) {
+    return res.status(400).json({
+      error: 'PASSWORD_UNCHANGED',
+      message: 'New password cannot be the same as your current password'
+    });
+  }
 
-    const isMatch = await comparePassword(oldPassword, user.password_hash);
+  try {
+    const userRes = await pool.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) {
+      return res.status(404).json({ error: 'USER_NOT_FOUND', message: 'User not found' });
+    }
+
+    const isMatch = await comparePassword(oldPassword, userRes.rows[0].password_hash);
     if (!isMatch) {
       return res.status(400).json({
         error: 'INVALID_CURRENT_PASSWORD',
-        message: 'The current password you provided is incorrect'
+        message: 'Current password provided is incorrect'
+      });
+    }
+
+    // Verify new password doesn't match current hash
+    const isSameAsCurrent = await comparePassword(newPassword, userRes.rows[0].password_hash);
+    if (isSameAsCurrent) {
+      return res.status(400).json({
+        error: 'PASSWORD_UNCHANGED',
+        message: 'New password cannot be the same as your current password'
       });
     }
 
@@ -423,49 +522,35 @@ router.post('/change-password', authenticate, async (req: AuthenticatedRequest, 
       [newHash, userId]
     );
 
-    // Invalidate all existing refresh tokens after password change
-    await pool.query(
-      `UPDATE refresh_tokens
-       SET revoked_at = NOW()
-       WHERE user_id = $1 AND revoked_at IS NULL`,
+    await logAudit({
+      userId,
+      action: 'PASSWORD_CHANGED',
+      entity: 'USER',
+      entityId: userId,
+      ipAddress
+    });
+
+    // Fetch updated user to issue fresh access token
+    const updatedUserRes = await pool.query(
+      'SELECT id, username, full_name, role, is_active, must_change_password FROM users WHERE id = $1',
       [userId]
     );
+    const updatedUser = updatedUserRes.rows[0];
 
-    // Issue fresh tokens with mustChangePassword = false
     const authUser = {
-      id: userId,
-      username: user.username,
-      fullName: user.full_name,
-      role: user.role,
-      isActive: user.is_active,
-      mustChangePassword: false
+      id: updatedUser.id,
+      username: updatedUser.username,
+      fullName: updatedUser.full_name,
+      role: updatedUser.role,
+      isActive: updatedUser.is_active,
+      mustChangePassword: updatedUser.must_change_password
     };
 
     const newAccessToken = generateAccessToken(authUser);
-    const newRefreshToken = generateRefreshToken();
-    const newExpiresAt = new Date(Date.now() + env.JWT_REFRESH_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
-
-    await pool.query(
-      `INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
-       VALUES ($1, $2, $3)`,
-      [userId, hashToken(newRefreshToken), newExpiresAt]
-    );
-
-    setRefreshCookie(res, newRefreshToken);
-
-    await logAudit({
-      userId,
-      action: 'USER_PASSWORD_CHANGE',
-      entity: 'USER',
-      entityId: userId,
-      afterState: { mustChangePassword: false },
-      ipAddress
-    });
 
     return res.json({
       message: 'Password changed successfully',
       accessToken: newAccessToken,
-      refreshToken: newRefreshToken,
       user: authUser
     });
   } catch (error) {
@@ -481,10 +566,7 @@ router.post('/change-password', authenticate, async (req: AuthenticatedRequest, 
  * GET /api/v1/auth/me
  */
 router.get('/me', authenticate, async (req: AuthenticatedRequest, res: Response) => {
-  return res.json({
-    user: req.user
-  });
+  return res.json({ user: req.user });
 });
 
 export { router as authRouter };
-

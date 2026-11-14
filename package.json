@@ -9,6 +9,7 @@
   "scripts": {
     "db:migrate": "npm --workspace=db run migrate",
     "db:migrate:down": "npm --workspace=db run migrate:down",
+    "db:setup-role": "npm --workspace=db run setup-role",
     "db:seed": "npm --workspace=db run seed",
     "db:seed:reference": "npm --workspace=db run seed:reference",
     "db:seed:demo": "npm --workspace=db run seed:demo",

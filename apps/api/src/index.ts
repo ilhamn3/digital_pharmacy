@@ -11,10 +11,25 @@ import { auditRouter } from './routes/audit.routes.js';
 import { productRouter } from './routes/product.routes.js';
 import { supplierRouter } from './routes/supplier.routes.js';
 import { customerRouter } from './routes/customer.routes.js';
+import { purchaseRouter } from './routes/purchase.routes.js';
+import { stockRouter } from './routes/stock.routes.js';
+import { reportRouter } from './routes/report.routes.js';
+import { settingsRouter } from './routes/settings.routes.js';
+import { saleRouter } from './routes/sale.routes.js';
+import { holdBillRouter } from './routes/hold-bill.routes.js';
 import { authenticate } from './middleware/auth.js';
+import { assertAppRoleSecurity } from './db/pool.js';
 
 const app = express();
 const port = env.PORT || 4000;
+
+// Trust proxy only when configured via TRUST_PROXY env variable
+if (process.env.TRUST_PROXY) {
+  const tpVal = process.env.TRUST_PROXY;
+  app.set('trust proxy', tpVal === 'true' ? true : (!isNaN(Number(tpVal)) ? Number(tpVal) : tpVal));
+} else {
+  app.set('trust proxy', false);
+}
 
 // Security Middleware
 app.use(helmet({
@@ -64,6 +79,12 @@ app.use('/api/v1/audit-logs', auditRouter);
 app.use('/api/v1/products', productRouter);
 app.use('/api/v1/suppliers', supplierRouter);
 app.use('/api/v1/customers', customerRouter);
+app.use('/api/v1/purchases', purchaseRouter);
+app.use('/api/v1/stock', stockRouter);
+app.use('/api/v1/reports', reportRouter);
+app.use('/api/v1/settings', settingsRouter);
+app.use('/api/v1/sales', saleRouter);
+app.use('/api/v1/hold-bills', holdBillRouter);
 
 // Test endpoint for role-based data masking verification
 app.get('/api/v1/test/price-visibility', authenticate, async (_req, res) => {

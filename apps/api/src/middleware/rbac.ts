@@ -15,39 +15,51 @@ const COST_PRICE_KEYS = new Set([
   'purchasecost',
   'purchase_price',
   'purchaseprice',
+  'cost',
+  'margin',
+  'profit',
   'supplier',
   'supplier_id',
   'supplierid',
   'supplier_name',
   'suppliername',
   'supplier_invoice_no',
-  'supplier_balance',
-  'cost'
+  'supplier_balance'
 ]);
 
 /**
- * Recursively strips cost price fields from outgoing data payloads.
+ * Recursively strips cost price and supplier fields from outgoing data payloads.
+ * Serializes via JSON first so Dates stay ISO strings and plain structures are recursed.
  */
 export function stripCostPrices(data: any): any {
   if (data === null || data === undefined) return data;
 
-  if (Array.isArray(data)) {
-    return data.map(stripCostPrices);
-  }
+  // Serialize via JSON first so Dates stay ISO strings
+  const serialized = JSON.parse(JSON.stringify(data));
 
-  if (typeof data === 'object') {
-    const cleaned: Record<string, any> = {};
-    for (const [key, val] of Object.entries(data)) {
-      if (COST_PRICE_KEYS.has(key.toLowerCase())) {
-        // Omit cost price key completely
-        continue;
-      }
-      cleaned[key] = stripCostPrices(val);
+  function clean(item: any): any {
+    if (item === null || item === undefined) return item;
+
+    if (Array.isArray(item)) {
+      return item.map(clean);
     }
-    return cleaned;
+
+    if (typeof item === 'object') {
+      const cleaned: Record<string, any> = {};
+      for (const [key, val] of Object.entries(item)) {
+        if (COST_PRICE_KEYS.has(key.toLowerCase())) {
+          // Omit sensitive cost/supplier key completely
+          continue;
+        }
+        cleaned[key] = clean(val);
+      }
+      return cleaned;
+    }
+
+    return item;
   }
 
-  return data;
+  return clean(serialized);
 }
 
 /**

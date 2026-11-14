@@ -77,7 +77,8 @@ router.get('/', authenticate, async (req: AuthenticatedRequest, res: Response) =
     );
     const total = parseInt(countRes.rows[0].count, 10);
 
-    // Stock is strictly derived by summing batches.current_quantity
+    // Stock is strictly derived by summing non-expired active batches.current_quantity
+    // Expired batches are calculated and reported separately
     const query = `
       SELECT 
         p.id,
@@ -92,7 +93,8 @@ router.get('/', authenticate, async (req: AuthenticatedRequest, res: Response) =
         p.is_active,
         p.created_at,
         p.updated_at,
-        COALESCE(SUM(b.current_quantity), 0)::NUMERIC(12,2) AS total_stock,
+        COALESCE(SUM(b.current_quantity) FILTER (WHERE b.expiry_date >= CURRENT_DATE), 0)::NUMERIC(12,2) AS total_stock,
+        COALESCE(SUM(b.current_quantity) FILTER (WHERE b.expiry_date < CURRENT_DATE), 0)::NUMERIC(12,2) AS expired_quantity,
         COUNT(b.id) FILTER (WHERE b.current_quantity > 0 AND b.expiry_date >= CURRENT_DATE)::INT AS active_batch_count,
         MIN(b.mrp) FILTER (WHERE b.current_quantity > 0 AND b.expiry_date >= CURRENT_DATE) AS min_mrp,
         MAX(b.mrp) FILTER (WHERE b.current_quantity > 0 AND b.expiry_date >= CURRENT_DATE) AS max_mrp
@@ -123,6 +125,8 @@ router.get('/', authenticate, async (req: AuthenticatedRequest, res: Response) =
         reorderLevel: p.reorder_level,
         isActive: p.is_active,
         totalStock: p.total_stock,
+        expiredQuantity: p.expired_quantity,
+        expiredStock: p.expired_quantity,
         activeBatchCount: p.active_batch_count,
         mrp: p.min_mrp ? (p.min_mrp === p.max_mrp ? p.min_mrp : `${p.min_mrp} - ${p.max_mrp}`) : null,
         createdAt: p.created_at,
@@ -194,7 +198,8 @@ router.get('/:id', authenticate, async (req: AuthenticatedRequest, res: Response
     const prodRes = await pool.query(
       `SELECT 
          p.*,
-         COALESCE(SUM(b.current_quantity), 0)::NUMERIC(12,2) AS total_stock
+         COALESCE(SUM(b.current_quantity) FILTER (WHERE b.expiry_date >= CURRENT_DATE), 0)::NUMERIC(12,2) AS total_stock,
+         COALESCE(SUM(b.current_quantity) FILTER (WHERE b.expiry_date < CURRENT_DATE), 0)::NUMERIC(12,2) AS expired_quantity
        FROM products p
        LEFT JOIN batches b ON p.id = b.product_id AND b.is_active = true
        WHERE p.id = $1
@@ -255,6 +260,8 @@ router.get('/:id', authenticate, async (req: AuthenticatedRequest, res: Response
         reorderLevel: product.reorder_level,
         isActive: product.is_active,
         totalStock: product.total_stock,
+        expiredQuantity: product.expired_quantity,
+        expiredStock: product.expired_quantity,
         batches: batchRes.rows.map((b) => {
           const item: Record<string, any> = {
             id: b.id,
@@ -573,42 +580,99 @@ router.post('/import-csv', authenticate, requireRoles('owner', 'pharmacist'), as
     const rowNum = i + 2; // header is row 1
     const errors: string[] = [];
 
-    // Map common column name variants
+    // Number validators for strict CSV validation
+    const isValidPositiveNumber = (val: string | undefined): boolean => {
+      if (!val || val.trim() === '') return false;
+      return /^\d+(\.\d+)?$/.test(val.trim()) && parseFloat(val.trim()) > 0;
+    };
+
+    const isValidNonNegativeNumber = (val: string | undefined): boolean => {
+      if (!val || val.trim() === '') return false;
+      return /^\d+(\.\d+)?$/.test(val.trim()) && parseFloat(val.trim()) >= 0;
+    };
+
+    const isValidPositiveInt = (val: string | undefined): boolean => {
+      if (!val || val.trim() === '') return false;
+      return /^\d+$/.test(val.trim()) && parseInt(val.trim(), 10) > 0;
+    };
+
+    // Text fields are never altered - preserved intact (e.g. "+Vitamin C")
     const productName = (r.product_name || r.product || r.name || '').trim();
     const genericName = (r.generic_name || r.generic || null)?.trim() || null;
     const barcode = r.barcode ? r.barcode.trim() : null;
     const category = (r.category || 'General').trim();
     const unit = (r.unit || 'tablet').trim();
-    const packSize = parseInt(r.pack_size || '1', 10);
     const isRxRequired = String(r.is_rx_required || r.rx || 'false').toLowerCase() === 'true';
-    const reorderLevel = parseFloat(r.reorder_level || '10');
+
+    // Pack size validation
+    const packSizeRaw = r.pack_size;
+    let packSize = 1;
+    if (packSizeRaw !== undefined && packSizeRaw !== '') {
+      if (!isValidPositiveInt(packSizeRaw)) {
+        errors.push(`Pack size must be a positive integer, received: '${packSizeRaw}'`);
+      } else {
+        packSize = parseInt(packSizeRaw.trim(), 10);
+      }
+    }
+
+    // Reorder level validation
+    const reorderLevelRaw = r.reorder_level;
+    let reorderLevel = 10;
+    if (reorderLevelRaw !== undefined && reorderLevelRaw !== '') {
+      if (!isValidNonNegativeNumber(reorderLevelRaw)) {
+        errors.push(`Reorder level must be a valid non-negative number, received: '${reorderLevelRaw}'`);
+      } else {
+        reorderLevel = parseFloat(reorderLevelRaw.trim());
+      }
+    }
 
     const batchNo = (r.batch_no || r.batch || '').trim();
     const expiryRaw = (r.expiry_date || r.expiry || '').trim();
-    const quantity = parseFloat(r.quantity || r.qty || '0');
+
+    // Quantity validation (must be positive, non-negative, well-formed)
+    const qtyRaw = r.quantity || r.qty;
+    let quantity = 0;
+    if (!qtyRaw || !isValidPositiveNumber(qtyRaw)) {
+      errors.push(`Quantity must be a positive number, received: '${qtyRaw}'`);
+    } else {
+      quantity = parseFloat(qtyRaw.trim());
+    }
     
     // Support either per-unit cost or pack cost
     const packCostRaw = r.pack_cost || r.packcost;
     const costPriceRaw = r.cost_price || r.cost || r.unit_cost;
     let costPrice = 0;
     if (costPriceRaw !== undefined && costPriceRaw !== '') {
-      costPrice = parseFloat(costPriceRaw);
+      if (!isValidNonNegativeNumber(costPriceRaw)) {
+        errors.push(`Cost price must be non-negative, received: '${costPriceRaw}'`);
+      } else {
+        costPrice = parseFloat(costPriceRaw.trim());
+      }
     } else if (packCostRaw !== undefined && packCostRaw !== '') {
-      const pCost = parseFloat(packCostRaw);
-      costPrice = pCost / (packSize > 0 ? packSize : 1);
+      if (!isValidNonNegativeNumber(packCostRaw)) {
+        errors.push(`Pack cost must be non-negative, received: '${packCostRaw}'`);
+      } else {
+        const pCost = parseFloat(packCostRaw.trim());
+        costPrice = pCost / (packSize > 0 ? packSize : 1);
+      }
     }
     // Round per-unit cost to 4 decimal places (NUMERIC(14,4))
     costPrice = Math.round(costPrice * 10000) / 10000;
 
-    const mrp = parseFloat(r.mrp || r.selling_price || '0');
+    // MRP validation
+    const mrpRaw = r.mrp || r.selling_price;
+    let mrp = 0;
+    if (mrpRaw !== undefined && mrpRaw !== '') {
+      if (!isValidNonNegativeNumber(mrpRaw)) {
+        errors.push(`MRP must be a valid non-negative number, received: '${mrpRaw}'`);
+      } else {
+        mrp = parseFloat(mrpRaw.trim());
+      }
+    }
 
     // Validations
     if (!productName) errors.push('Product name is required');
     if (!batchNo) errors.push('Batch number is required');
-    if (isNaN(quantity) || quantity <= 0) errors.push('Quantity must be a positive number');
-    if (isNaN(costPrice) || costPrice < 0) errors.push('Cost price must be non-negative');
-    if (isNaN(mrp) || mrp < 0) errors.push('MRP must be non-negative');
-    if (isNaN(packSize) || packSize <= 0) errors.push('Pack size must be at least 1');
 
     // Date parsing: accept YYYY-MM-DD, or MM/YYYY, or MM-YYYY
     let parsedExpiry: string | null = null;
