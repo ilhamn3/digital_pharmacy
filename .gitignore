@@ -25,3 +25,8 @@ logs/
 # Docker volume data if bound locally
 .postgres-data/
 
+# Test results and reports
+test-results/
+playwright-report/
+blob-report/
+

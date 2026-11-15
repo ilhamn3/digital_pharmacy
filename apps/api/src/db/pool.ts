@@ -56,6 +56,13 @@ export async function assertAppRoleSecurity(dbPool: Pool = pool): Promise<{
   const appPass = process.env.APP_DB_PASSWORD || '';
   const isDefaultPassword = appPass === 'pharmacy_app_pass' || dbUrl.includes(':pharmacy_app_pass@');
 
+  if (process.env.NODE_ENV === 'test') {
+    const cleanUrl = dbUrl.split('?')[0];
+    if (!cleanUrl.endsWith('_test')) {
+      throw new Error(`[SECURITY] Refusing to run in test mode: DATABASE_URL must end with '_test'. Received: '${cleanUrl}'`);
+    }
+  }
+
   if (isDefaultPassword) {
     const passError = `Security Violation: Production database password must not use the default password from .env.example ('pharmacy_app_pass'). Please configure a strong, unique APP_DB_PASSWORD.`;
     if (process.env.NODE_ENV === 'production') {
