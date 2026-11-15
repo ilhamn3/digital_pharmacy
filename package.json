@@ -14,11 +14,14 @@
     "db:seed:reference": "npm --workspace=db run seed:reference",
     "db:seed:demo": "npm --workspace=db run seed:demo",
     "bootstrap:owner": "npm --workspace=db run bootstrap:owner --",
+    "test:db:reset": "tsx db/scripts/test-db-reset.ts",
     "dev:api": "npm --workspace=apps/api run dev",
     "dev:web": "npm --workspace=apps/web run dev",
     "build:api": "npm --workspace=apps/api run build",
     "build:web": "npm --workspace=apps/web run build",
-    "test": "npm --workspace=apps/api test"
+    "test": "npm --workspace=apps/api test",
+    "test:web": "npm --workspace=apps/web test",
+    "test:e2e": "playwright test"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

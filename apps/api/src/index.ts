@@ -100,7 +100,7 @@ app.get('/api/v1/test/price-visibility', authenticate, async (_req, res) => {
   });
 });
 
-if (env.NODE_ENV !== 'test') {
+if (env.NODE_ENV !== 'test' || process.env.PLAYWRIGHT === 'true') {
   app.listen(port, () => {
     console.log(`🚀 Pharmacy POS API server running on port ${port} [Timezone: ${env.TIMEZONE}]`);
   });

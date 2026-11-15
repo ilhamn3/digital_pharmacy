@@ -298,6 +298,9 @@ holdBillRouter.get('/:id/resume', async (req: AuthenticatedRequest, res: Respons
         allAvailable = false;
       }
 
+      const heldPrice = Number(item.unit_price);
+      const isPriceChanged = Number(currentMrp) !== heldPrice;
+
       repricedItems.push({
         id: item.id,
         productId: item.product_id,
@@ -307,6 +310,8 @@ holdBillRouter.get('/:id/resume', async (req: AuthenticatedRequest, res: Respons
         quantity: requestedQty,
         discountAmount: Number(item.discount_amount),
         currentMrp,
+        heldPrice,
+        priceChanged: isPriceChanged,
         availableStock,
         isAvailable: isSufficient
       });
